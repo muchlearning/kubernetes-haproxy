@@ -193,7 +193,7 @@ def update(data):
                     if event["action"] == "delete" or not pod_ready(pod):
                         changed = False
                         for service_config in services.itervalues():
-                            if service_config["namespace"] == namespace and podname in service_config.pods:
+                            if service_config["namespace"] == namespace and podname in service_config["pods"]:
                                 changed = True
                                 del service_config["pods"][podname]
                         if changed:
