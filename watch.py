@@ -267,6 +267,7 @@ if __name__ == "__main__":
                         with open("ssl/%s.pem" % name, 'w') as f:
                             f.write(certdata["key"])
                             f.write(certdata["cert"])
+                        certhashes[name] = currhash
 
             if changed:
                 cmd = ["/usr/sbin/haproxy", "-D", "-p", "/run/haproxy.pid", "-f", os.path.abspath("haproxy.cfg")]
