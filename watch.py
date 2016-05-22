@@ -24,6 +24,8 @@ def etcd_open(path):
     return urllib2.urlopen(ETCD2BASE + path)
 
 def pod_ready(pod):
+    if "podIP" not in pod["status"] or not pod["status"]["podIP"]:
+        return False
     containerStatuses = pod["status"]["containerStatuses"]
     if len(containerStatuses) == 0:
         return False
