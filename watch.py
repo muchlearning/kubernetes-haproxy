@@ -26,6 +26,8 @@ def etcd_open(path):
 def pod_ready(pod):
     if "podIP" not in pod["status"] or not pod["status"]["podIP"]:
         return False
+    if "containerStatuses" not in pod["status"]:
+        return False
     containerStatuses = pod["status"]["containerStatuses"]
     if len(containerStatuses) == 0:
         return False
