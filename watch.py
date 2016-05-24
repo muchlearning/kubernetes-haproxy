@@ -191,8 +191,8 @@ def update(data):
                 return
             elif node_key.startswith("/registry/pods/"):
                 m = pod_re.match(node_key)
-                pod = json.loads(event["node"]["value"])
                 if m:
+                    pod = json.loads(event["node"]["value"]) if "value" in event["node"] else {"status": {}}
                     namespace, podname = m.group(1, 2)
                     if event["action"] == "delete" or not pod_ready(pod):
                         changed = False
