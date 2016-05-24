@@ -1,5 +1,6 @@
 FROM alpine:3.3
 MAINTAINER Hubert Chathi <hubert@muchlearning.org>
+EXPOSE 80 443 1936
 RUN apk add --update haproxy python py-jinja2 \
     && rm -rf /var/cache/apk/*
 COPY dumb-init /usr/local/bin/
