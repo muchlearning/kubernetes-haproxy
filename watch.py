@@ -187,7 +187,6 @@ def update(data):
             if node_key == "/registry/configmaps/lb/services":
                 configmap = json.loads(event["node"]["value"])
                 data["services"] = load_services(configmap)
-                set_service(services, key, json.loads(event["node"]["value"]))
                 return
             elif node_key.startswith("/registry/pods/"):
                 m = pod_re.match(node_key)
