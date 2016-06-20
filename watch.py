@@ -247,7 +247,8 @@ if __name__ == "__main__":
             config = jinja2.Template(data["template"]).render(stats={"username": "stats", "password": statspass},
                                                               services=serviceslist,
                                                               certificates=certificatelist,
-                                                              ssldir=os.path.abspath("ssl"))
+                                                              ssldir=os.path.abspath("ssl"),
+                                                              env=os.environ)
             changed = False
             currhash = hashlib.sha512(config).digest()
             if currhash != lasthash:
