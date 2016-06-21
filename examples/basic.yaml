@@ -1,0 +1,62 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config
+  namespace: lb
+data:
+  etcd2base: http://192.168.0.1:2379
+  template: |
+    global
+      #log /dev/stdout local0
+      #log /dev/stdout local1 notice
+      log-send-hostname
+      maxconn 4096
+      user haproxy
+      group haproxy
+      daemon
+      stats socket /var/run/haproxy.stats level admin
+    defaults
+      balance leastconn
+      log global
+      mode http
+      option redispatch
+      option httplog
+      option dontlognull
+      option forwardfor
+      timeout connect 5000
+      timeout client 50000
+      timeout server 50000
+    listen stats
+      bind :::1936 v4v6
+      mode http
+      stats enable
+      timeout connect 10s
+      timeout client 1m
+      timeout server 1m
+      stats hide-version
+      stats realm Haproxy\ Statistics
+      stats uri /
+      stats auth {{stats.username}}:{{stats.password}}
+    frontend port_80
+      bind :::80 v4v6
+      acl is_websocket hdr(Upgrade) -i WebSocket
+    {%- for service in services %}{% set outer = loop %}
+    {%- for hostname in service.hostnames %}
+    {%- set rulenum = "%d_%d" % (outer.index, loop.index) %}
+      acl host_rule_{{rulenum}} {% if hostname.startswith('^') %}hdr_reg(host) -i {{hostname[1:]}}{% else %}hdr(host) -i {{hostname}}{% endif %}
+      acl host_rule_{{rulenum}}_port {% if hostname.startswith('^') %}hdr_reg(host) -i {{hostname}}:80${% else %}hdr(host) -i {{hostname}}:80{% endif %}
+    {%- if "path" in service %}
+      acl path_rule_{{rulenum}} path_reg -i {{service.path}}
+    {%- endif %}
+      use_backend SERVICE_{{service.name|upper}} if {% if "path" in service %}path_rule_{{rulenum}} host_rule_{{rulenum}} or path_rule_{{rulenum}} host_rule_{{rulenum}}_port{% else %}host_rule_{{rulenum}} or host_rule_{{rulenum}}_port{% endif %}
+    {% endfor -%}
+    {% endfor -%}
+    {%- for service in services %}
+    backend SERVICE_{{service.name|upper}}
+    {%- for pod in service.pods.itervalues() if pod.status.podIP %}{% set outer = loop %}
+    {%- for port in service.ports %}
+    {%- set podnum = "%d_%d" % (outer.index, loop.index) %}
+      server {{service.name|upper}}_{{podnum}} {{pod.status.podIP}}:{{port}} check
+    {% endfor -%}
+    {% endfor -%}
+    {% endfor %}

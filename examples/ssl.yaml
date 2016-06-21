@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config
+  namespace: lb
+data:
+  etcd2base: http://192.168.0.1:2379
+  template: |
+    global
+      #log /dev/stdout local0
+      #log /dev/stdout local1 notice
+      log-send-hostname
+      maxconn 4096
+      user haproxy
+      group haproxy
+      daemon
+      stats socket /var/run/haproxy.stats level admin
+      ssl-default-bind-options no-sslv3 no-tls-tickets
+      ssl-default-bind-ciphers ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES128-SHA256:ECDHE-RSA-AES128-SHA256:ECDHE-ECDSA-AES128-SHA:ECDHE-RSA-AES128-SHA:DHE-RSA-AES128-SHA:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-AES256-SHA384:ECDHE-RSA-AES256-SHA384:ECDHE-RSA-AES256-SHA:ECDHE-ECDSA-AES256-SHA:AES128-GCM-SHA256:AES128-SHA256:AES128-SHA:AES256-GCM-SHA384:AES256-SHA256:AES256-SHA:DHE-DSS-AES128-SHA:DES-CBC3-SHA
+      tune.ssl.default-dh-param 2048
+    defaults
+      balance leastconn
+      log global
+      mode http
+      option redispatch
+      option httplog
+      option dontlognull
+      option forwardfor
+      timeout connect 5000
+      timeout client 50000
+      timeout server 50000
+    listen stats
+      bind :::1936 v4v6
+      mode http
+      stats enable
+      timeout connect 10s
+      timeout client 1m
+      timeout server 1m
+      stats hide-version
+      stats realm Haproxy\ Statistics
+      stats uri /
+      stats auth {{stats.username}}:{{stats.password}}
+    {%- if certificates %}
+    frontend port_443
+      bind :::443 v4v6 ssl{% for certificate in certificates %} crt {{ssldir}}/{{certificate}}.pem{% endfor %}
+      reqadd X-Forwarded-Proto:\ https
+      acl is_websocket hdr(Upgrade) -i WebSocket
+    {%- for service in services %}{% set outer = loop %}
+    {%- if service.ssl %}
+    {%- for hostname in service.hostnames %}
+    {%- set rulenum = "%d_%d" % (outer.index, loop.index) %}
+      acl host_rule_{{rulenum}} {% if hostname.startswith('^') %}hdr_reg(host) -i {{hostname[1:]}}{% else %}hdr(host) -i {{hostname}}{% endif %}
+      acl host_rule_{{rulenum}}_port {% if hostname.startswith('^') %}hdr_reg(host) -i {{hostname}}:443${% else %}hdr(host) -i {{hostname}}:443{% endif %}
+    {%- if "path" in service %}
+      acl path_rule_{{rulenum}} path_reg -i {{service.path}}
+    {% endif %}
+      use_backend SERVICE_{{service.name|upper}} if {% if "path" in service %}path_rule_{{rulenum}} host_rule_{{rulenum}} or path_rule_{{rulenum}} host_rule_{{rulenum}}_port{% else %}host_rule_{{rulenum}} or host_rule_{{rulenum}}_port{% endif %}
+    {% endfor -%}
+    {% endif -%}
+    {% endfor -%}
+    {% endif %}
+    frontend port_80
+      bind :::80 v4v6
+      acl is_websocket hdr(Upgrade) -i WebSocket
+    {%- for service in services %}{% set outer = loop %}
+    {%- for hostname in service.hostnames %}
+    {%- set rulenum = "%d_%d" % (outer.index, loop.index) %}
+      acl host_rule_{{rulenum}} {% if hostname.startswith('^') %}hdr_reg(host) -i {{hostname[1:]}}{% else %}hdr(host) -i {{hostname}}{% endif %}
+      acl host_rule_{{rulenum}}_port {% if hostname.startswith('^') %}hdr_reg(host) -i {{hostname}}:80${% else %}hdr(host) -i {{hostname}}:80{% endif %}
+    {%- if "path" in service %}
+      acl path_rule_{{rulenum}} path_reg -i {{service.path}}
+    {%- endif %}
+      use_backend SERVICE_{{service.name|upper}} if {% if "path" in service %}path_rule_{{rulenum}} host_rule_{{rulenum}} or path_rule_{{rulenum}} host_rule_{{rulenum}}_port{% else %}host_rule_{{rulenum}} or host_rule_{{rulenum}}_port{% endif %}
+    {% endfor -%}
+    {% endfor -%}
+    {%- for service in services %}
+    backend SERVICE_{{service.name|upper}}
+    {%- for pod in service.pods.itervalues() if pod.status.podIP %}{% set outer = loop %}
+    {%- for port in service.ports %}
+    {%- set podnum = "%d_%d" % (outer.index, loop.index) %}
+      server {{service.name|upper}}_{{podnum}} {{pod.status.podIP}}:{{port}} check
+    {% endfor -%}
+    {% endfor -%}
+    {% endfor %}
