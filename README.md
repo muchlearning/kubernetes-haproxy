@@ -78,3 +78,4 @@ The `examples` directory has various examples for the configuration template.
 - `varnish.yaml` passes requests to a Varnish cache for services that are
   configured to do so in a setup similar to the one described in
   http://blog.haproxy.com/2012/08/25/haproxy-varnish-and-the-single-hostname-website/
+  (see also https://github.com/muchlearning/kubernetes-varnish)
