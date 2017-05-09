@@ -12,13 +12,21 @@ a change is detected, the configuration is updated, and HAProxy is gracefully
 reloaded if needed.  It uses etcd2's watch feature rather than polling, so
 updates should be near-instantaneous.
 
+### Important Note
+
+Previous versions pulled the configuration from etcd, but this failed when
+Kubernetes used etcd3.  This version now pulls the configuration from the
+Kubernetes server instead, but will require changes to the configuration.  In
+particular, the `K8SBASE` environment variable needs to be set, pointing to the
+URL of the Kubernetes API server.
+
 ## Configuration
 
 ### Environment variables
 
-- `ETCD2BASE`: (required) the base URL for the etcd2 server (with no trailing
-  slash).  The URL must be an HTTP URL; HTTPS is not (yet) supported.  Defaults
-  to `http://127.0.0.1:2379` (which will probably not work).
+- `K8SBASE`: (required) the base URL for the Kubernetes API server (with no
+  trailing slash).  The URL must be an HTTP URL; HTTPS is not (yet) supported.
+  Defaults to `http://127.0.0.1:8080` (which will probably not work).
 - `STATISTICS_PASSWORD`: (optional) the password for accessing the server
   statistics.  Defaults to "IAmAnIdiotForNotChangingTheDefaultPassword".  Only
   needed if you are exposing server statistics in the template.

@@ -1,27 +1,24 @@
 #!/usr/bin/python
 
 import base64
+import gevent
+import gevent.event
 import hashlib
 import json
 import jinja2
 from operator import itemgetter
 import os
 import os.path
-import re
+import requests
 import subprocess
 import sys
-import time
-import urllib2
 
-ETCD2BASE = os.getenv("ETCD2BASE") or "http://127.0.0.1:2379"
+from gevent import monkey
+monkey.patch_all()
 
-generation = None
+K8SBASE = os.getenv("K8SBASE") or "http://127.0.0.1:8000"
 
-class FellBehind(Exception):
-    pass
-
-def etcd_open(path):
-    return urllib2.urlopen(ETCD2BASE + path)
+change_event  = gevent.event.Event()
 
 def pod_ready(pod):
     if "podIP" not in pod["status"] or not pod["status"]["podIP"]:
@@ -43,52 +40,32 @@ def pod_matches(selector, pod):
             if key not in labels or labels[key] != value:
                 return False
         return True
-    return len({}) == 0
+    return False
 
-def get_pods(config, cache):
+def get_pods(config, all_pods):
     namespace = config["namespace"]
-    if namespace not in cache:
-        try:
-            response = etcd_open("/v2/keys/registry/pods/" + namespace + "/")
-            response_json = response.read()
-        except urllib2.HTTPError as e:
-            if e.code == 404:
-                return ({}, cache)
-            else:
-                raise e
-        finally:
-            try:
-                response.close()
-            except:
-                pass
-        node = json.loads(response_json)["node"]
-        pods = node["nodes"] if "nodes" in node else []
-        cache[namespace] = [json.loads(pod["value"]) for pod in pods]
+    if namespace not in all_pods:
+        return {}
     pods = {}
-    for pod in cache[namespace]:
+    for pod in all_pods[namespace].itervalues():
         if pod_matches(config["selector"], pod):
             pods[pod["metadata"]["name"]] = pod
-    return (pods, cache)
+    return pods
 
-def load_services(configmap):
-    services_nodes = configmap["data"]
+def load_services(services_nodes, all_pods):
     services = {}
-    cache = {}
     for key, service in services_nodes.iteritems():
         service_config = json.loads(service)
-        set_service(services, key, service_config, cache)
+        set_service(services, key, service_config, all_pods)
     return services
 
-def set_service(services, key, service_config, cache = {}):
-    service_config["pods"], cache = get_pods(service_config, cache)
+def set_service(services, key, service_config, all_pods):
+    service_config["pods"] = get_pods(service_config, all_pods)
     services[key] = service_config
     services[key]["name"] = key
 
-def load_certs(configmap):
-    return configmap["data"]
-
-def load_keys(secrets):
-    return {name: base64.b64decode(b64key) for name, b64key in secrets["data"].iteritems()}
+def load_keys(keys):
+    return {name: base64.b64decode(b64key) for name, b64key in keys.iteritems()}
 
 def merge_certs_and_keys(certs, keys):
     result = {}
@@ -103,152 +80,116 @@ def merge_certs_and_keys(certs, keys):
 
     return result
 
-def refresh():
-    global generation
-    try:
-        response = etcd_open("/v2/keys/registry/configmaps/lb/services")
-        response_json = response.read()
-        generation = int(response.info().getheader('X-Etcd-Index'))
-    finally:
-        try:
-            response.close()
-        except:
-            pass
+class K8sWatcher(gevent.Greenlet):
+    def _run(self):
+        while True:
+            req = requests.get(K8SBASE + "/api/v1/watch/" + self._path, stream=True)
+            lines = req.iter_lines()
+            for line in lines:
+                self._process_line(line)
 
-    services = load_services(json.loads(json.loads(response_json)["node"]["value"]))
+    def _process_line(self, line):
+        data = json.loads(line)
+        return self._process_json(data)
 
-    certs = {}
-    try:
-        response = etcd_open("/v2/keys/registry/configmaps/lb/certificates")
-        response_json = response.read()
-        certs = load_certs(json.loads(json.loads(response_json)["node"]["value"]))
-    except urllib2.HTTPError as e:
-        if e.code != 404:
-            raise e
-    finally:
-        try:
-            response.close()
-        except:
-            pass
+class PodWatcher(K8sWatcher):
+    _path = "pods"
 
-    keys = {}
-    try:
-        response = etcd_open("/v2/keys/registry/secrets/lb/keys")
-        response_json = response.read()
-        keys = load_keys(json.loads(json.loads(response_json)["node"]["value"]))
-    except urllib2.HTTPError as e:
-        if e.code != 404:
-            raise e
-    finally:
-        try:
-            response.close()
-        except:
-            pass
+    def __init__(self):
+        K8sWatcher.__init__(self)
+        self.pods = {}
 
-    try:
-        response = etcd_open("/v2/keys/registry/configmaps/lb/config")
-        response_json = response.read()
-    finally:
-        try:
-            response.close()
-        except:
-            pass
+    def _process_json(self, json):
+        if (json["object"] and json["object"]["kind"] == "Pod"):
+            pod = json["object"]
+            uid = pod["metadata"]["uid"]
+            namespace = pod["metadata"]["namespace"]
+            if json["type"] != "DELETED" and pod_ready(pod):
+                if namespace not in self.pods:
+                    self.pods[namespace] = {}
+                self.pods[namespace][uid] = pod
+                change_event.set()
+            elif namespace in self.pods and uid in self.pods[namespace]:
+                del self.pods[namespace][uid]
+                change_event.set()
 
-    node = json.loads(response_json)["node"]
-    config = json.loads(node["value"])["data"]
-    template = config["template"]
-    return {
-        "services": services,
-        "certificates": merge_certs_and_keys(certs, keys),
-        "template": template
-    }
+class ConfigWatcher(K8sWatcher):
+    def __init__(self, namespace, configmap = None, configname = None):
+        K8sWatcher.__init__(self)
+        self._path = "namespaces/" + namespace + "/configmaps"
+        self.configmap = configmap
+        if configmap:
+            self._path = self.path + "/" + configmap
+        self.configname = configname
+        if configname:
+            self.config = None
+        else:
+            self.config = {}
 
-pod_re = re.compile("^/registry/pods/([^/]+)/([^/]+)$")
+    def _process_json(self, json):
+        if (json["object"] and json["object"]["kind"] == "ConfigMap"):
+            obj = json["object"]
+            if self.configname:
+                self.config = obj["data"][self.configname]
+            elif self.configmap:
+                self.config = obj["data"]
+            else:
+                if obj["metadata"]["name"] not in self.config:
+                    self.config[obj["metadata"]["name"]] = {}
+                self.config[obj["metadata"]["name"]] = obj["data"]
+                change_event.set()
 
-def update(data):
-    services = data["services"]
-    certificates = data["certificates"]
-    global generation
-    while True:
-        try:
-            response = etcd_open("/v2/keys?wait=true&recursive=true&waitIndex=%d" % (generation + 1))
-            response_json = response.read()
-            if generation < int(response.info().getheader('X-Etcd-Index')) - 10:
-                raise FellBehind()
-            generation = generation + 1
-        finally:
-            try:
-                response.close()
-            except:
-                pass
-        event = json.loads(response_json)
-        if "node" in event:
-            node_key = event["node"]["key"]
-            if node_key == "/registry/configmaps/lb/services":
-                configmap = json.loads(event["node"]["value"])
-                data["services"] = load_services(configmap)
-                return
-            elif node_key.startswith("/registry/pods/"):
-                m = pod_re.match(node_key)
-                if m:
-                    pod = json.loads(event["node"]["value"]) if "value" in event["node"] else {"status": {}}
-                    namespace, podname = m.group(1, 2)
-                    if event["action"] == "delete" or not pod_ready(pod):
-                        changed = False
-                        for service_config in services.itervalues():
-                            if service_config["namespace"] == namespace and podname in service_config["pods"]:
-                                changed = True
-                                del service_config["pods"][podname]
-                        if changed:
-                            return
-                    else:
-                        changed = False
-                        for service_config in services.itervalues():
-                            if service_config["namespace"] == namespace and pod_matches(service_config["selector"], pod):
-                                changed = True
-                                service_config["pods"][podname] = pod
-                        if changed:
-                            return
-            elif node_key == "/registry/configmaps/lb/config":
-                config = json.loads(event["node"]["value"])["data"]
-                data["template"] = config["template"]
-                return
-            elif node_key == "/registry/configmaps/lb/certificates":
-                keys = {k: v["key"] for k, v in data["certificates"].iteritems() if "key" in v}
-                certs = load_certs(json.loads(event["node"]["value"]))
-                data["certificates"] = merge_certs_and_keys(certs, keys)
-                return
-            elif node_key == "/registry/secrets/lb/keys":
-                certs = {k: v["cert"] for k, v in data["certificates"].iteritems() if "cert" in v}
-                keys = load_keys(json.loads(event["node"]["value"]))
-                data["certificates"] = merge_certs_and_keys(certs, keys)
-                return
+class SecretsWatcher(K8sWatcher):
+    def __init__(self, namespace, configmap, configname = None):
+        K8sWatcher.__init__(self)
+        self._path = "namespaces/" + namespace + "/secrets/" + configmap
+        self.configname = configname
+        if configname:
+            self.config = None
+        else:
+            self.config = {}
+
+    def _process_json(self, json):
+        if (json["object"] and json["object"]["kind"] == "Secret"):
+            if self.configname:
+                self.config = json["object"]["data"][self.configname]
+            else:
+                self.config = json["object"]["data"]
+            change_event.set()
+
+pod_watcher = PodWatcher()
+pod_watcher.start()
+key_watcher = SecretsWatcher("lb", "keys")
+key_watcher.start()
+config_watcher = ConfigWatcher("lb")
+config_watcher.start()
+
+gevent.sleep(0.25) # wait a bit for the initial data
+
+sys.stderr.write("Debug: starting\n")
 
 if __name__ == "__main__":
     statspass = os.getenv("STATISTICS_PASSWORD")
     lasthash = None
     certhashes = {}
     while True:
-        backoff = 1
-        while True:
-            try:
-                data = refresh()
-                break
-            except Exception as e:
-                sys.stderr.write("Error: Could not load configuration (%s).  Will try again in %d s\n" % (str(e), backoff))
-                time.sleep(backoff)
-                if backoff < 32:
-                    backoff *= 2
+        change_event.wait()
+        change_event.clear()
 
-        while True:
-            serviceslist = data["services"].values()
+        if "config" in config_watcher.config and "template" in config_watcher.config["config"] \
+           and "services" in config_watcher.config:
+            cfg = config_watcher.config
+            serviceslist = load_services(cfg["services"], pod_watcher.pods).values()
             serviceslist.sort(key=itemgetter("name"))
-            certificatelist = [name for name, certdata in data["certificates"].iteritems() if "key" in certdata and "cert" in certdata]
-            config = jinja2.Template(data["template"]).render(stats={"username": "stats", "password": statspass},
-                                                              services=serviceslist,
-                                                              certificates=certificatelist,
-                                                              ssldir=os.path.abspath("ssl"),
-                                                              env=os.environ)
+            certs = merge_certs_and_keys(cfg["certificates"] if "certificates" in cfg else {},
+                                         load_keys(key_watcher.config))
+            certificatelist = [name for name, certdata in certs.iteritems() if "key" in certdata and "cert" in certdata]
+            config = jinja2.Template(cfg["config"]["template"]).render(
+                stats={"username": "stats", "password": statspass},
+                services=serviceslist,
+                certificates=certificatelist,
+                ssldir=os.path.abspath("ssl"),
+                env=os.environ)
             changed = False
             currhash = hashlib.sha512(config).digest()
             if currhash != lasthash:
@@ -260,7 +201,7 @@ if __name__ == "__main__":
                 sys.stderr.write("Debug: config file did not change\n")
             lasthash = currhash
 
-            for name, certdata in data["certificates"].iteritems():
+            for name, certdata in certs.iteritems():
                 if "key" in certdata and "cert" in certdata:
                     sha512 = hashlib.sha512(certdata["key"])
                     sha512.update(certdata["cert"])
@@ -284,9 +225,3 @@ if __name__ == "__main__":
                     pass
                 sys.stderr.write("Debug: reloading HAProxy\n")
                 subprocess.call(cmd)
-
-            try:
-                update(data)
-            except Exception as e:
-                sys.stderr.write("Warning: Failed to update (%s).  Reloading config\n" % (str(e)))
-                break
