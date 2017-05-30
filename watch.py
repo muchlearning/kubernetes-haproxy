@@ -154,6 +154,7 @@ class SecretsWatcher(K8sWatcher):
 
     def _process_json(self, json):
         if (json["object"] and json["object"]["kind"] == "Secret"):
+            obj = json["object"]
             if self.configname:
                 if "data" in obj and self.configname in obj["data"]:
                     self.config = json["object"]["data"][self.configname]
